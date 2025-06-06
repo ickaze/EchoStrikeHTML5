@@ -1,0 +1,533 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <title>Echo Strike (HTML5)</title>
+  <style>
+    canvas {
+      background: #0A0A1E;
+      display: block;
+      margin: 0 auto;
+    }
+    body {
+      margin: 0;
+      overflow: hidden;
+      color: #FFFFFF;
+      font-family: sans-serif;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="gameCanvas" width="800" height="600"></canvas>
+  <script>
+    // ---------------------------------------------
+    // 定数定義
+    // ---------------------------------------------
+    const SCREEN_WIDTH  = 800;
+    const SCREEN_HEIGHT = 600;
+    const FPS = 60;
+
+    const PLAYER_SPEED = 5;
+    const PLAYER_BULLET_SPEED = 10;
+
+    const PLAYER_WIDTH  = 50;
+    const PLAYER_HEIGHT = 8;
+    const ENEMY_WIDTH   = 50;
+    const ENEMY_HEIGHT  = 50;
+    const BULLET_WIDTH  = 10;
+    const BULLET_HEIGHT = 5;
+
+    const BASE_ENEMY_BULLET_SPEED    = 8;
+    const BASE_ENEMY_FIRE_INTERVAL   = 1000; // ms
+
+    const ENEMY_HISTORY_LEN = 20; // プレイヤー y 座標を記憶する長さ
+
+    const DODGE_MARGIN = 50; // 敵の回避余裕
+
+    const X_COOLDOWN = 1000; // Xキーショットのクールダウン（ms）
+
+    // ---------------------------------------------
+    // ヘルパー関数
+    // ---------------------------------------------
+    function now() {
+      return performance.now();
+    }
+
+    // ---------------------------------------------
+    // クラス定義
+    // ---------------------------------------------
+    class Bullet {
+      constructor(x, y, vx, vy, color) {
+        this.x = x;
+        this.y = y;
+        this.vx = vx;
+        this.vy = vy;
+        this.color = color;
+        this.active = true;
+      }
+      update(deltaTime) {
+        if (!this.active) return;
+        this.x += this.vx * deltaTime;
+        this.y += this.vy * deltaTime;
+        if (
+          this.x + BULLET_WIDTH < 0 ||
+          this.x > SCREEN_WIDTH ||
+          this.y + BULLET_HEIGHT < 0 ||
+          this.y > SCREEN_HEIGHT
+        ) {
+          this.active = false;
+        }
+      }
+      draw(ctx) {
+        if (!this.active) return;
+        ctx.fillStyle = this.color;
+        ctx.fillRect(this.x, this.y, BULLET_WIDTH, BULLET_HEIGHT);
+      }
+    }
+
+    class Player {
+      constructor() {
+        this.width  = PLAYER_WIDTH;
+        this.height = PLAYER_HEIGHT;
+        this.x = 10;
+        this.y = (SCREEN_HEIGHT - this.height) / 2;
+        this.speed = PLAYER_SPEED;
+      }
+      update(input) {
+        if (input.isDown('ArrowUp') && this.y > 0) {
+          this.y -= this.speed;
+        }
+        if (input.isDown('ArrowDown') && this.y + this.height < SCREEN_HEIGHT) {
+          this.y += this.speed;
+        }
+      }
+      draw(ctx) {
+        ctx.fillStyle = '#00C800'; // 緑
+        ctx.fillRect(this.x, this.y, this.width, this.height);
+      }
+      shootZ(bullets) {
+        const bx = this.x + this.width;
+        const by = this.y + this.height / 2 - BULLET_HEIGHT / 2;
+        bullets.push(new Bullet(bx, by, PLAYER_BULLET_SPEED, 0, '#FFFF00')); // 黄色
+      }
+      shootX(bullets) {
+        const speed = PLAYER_BULLET_SPEED * 0.75;
+        const angle = 11.25 * Math.PI / 180;
+        const cosA = Math.cos(angle);
+        const sinA = Math.sin(angle);
+        const bx = this.x + this.width;
+        const by = this.y + this.height / 2 - BULLET_HEIGHT / 2;
+        // 前方
+        bullets.push(new Bullet(bx, by, speed, 0, '#FFFF00'));
+        // 上斜め
+        bullets.push(new Bullet(bx, by, speed * cosA, -speed * sinA, '#FFFF00'));
+        // 下斜め
+        bullets.push(new Bullet(bx, by, speed * cosA, speed * sinA, '#FFFF00'));
+      }
+    }
+
+    class Enemy {
+      constructor(roundNumber) {
+        this.width  = ENEMY_WIDTH;
+        this.height = ENEMY_HEIGHT;
+        this.x = SCREEN_WIDTH - this.width - 10;
+        this.y = (SCREEN_HEIGHT - this.height) / 2;
+
+        this.bulletSpeed = BASE_ENEMY_BULLET_SPEED + (roundNumber - 1) * 2;
+        const intervalMs = BASE_ENEMY_FIRE_INTERVAL - (roundNumber - 1) * 100;
+        this.fireInterval = Math.max(300, intervalMs);
+
+        this.lastFireTime = 0;
+        this.playerYHistory = [];
+
+        this.baseSpeed = PLAYER_SPEED - 1;
+        this.maxSpeed  = this.baseSpeed * 4;
+        this.idleDirection = 1;
+        this.lastIdleSwitch = 0;
+        this.idleInterval = 1000; // ms
+
+        this.directions = 2 * roundNumber + 1;
+      }
+      update(player, playerBullets, enemyBullets, currentTime) {
+        // 1) 最も危険度の高い弾を探す
+        let threatening = null;
+        let minTimeToHit = Infinity;
+        for (const b of playerBullets) {
+          if (!b.active) continue;
+          if (b.vx > 0 && b.x < this.x) {
+            const distX = this.x - b.x;
+            const timeToHit = b.vx !== 0 ? distX / b.vx : Infinity;
+            const predictedY = b.y + b.vy * timeToHit;
+            const centerY = this.y + this.height / 2;
+            if (Math.abs(predictedY - centerY) < DODGE_MARGIN) {
+              if (timeToHit < minTimeToHit) {
+                minTimeToHit = timeToHit;
+                threatening = b;
+              }
+            }
+          }
+        }
+
+        // 2) 回避動作
+        const centerY = this.y + this.height / 2;
+        if (threatening) {
+          const distX = this.x - threatening.x;
+          const timeToHit = threatening.vx !== 0 ? distX / threatening.vx : 1;
+          const predictedY = threatening.y + threatening.vy * timeToHit;
+          let direction, verticalDist;
+          if (predictedY < centerY) {
+            direction = 1; // 下へ逃げ
+            verticalDist = Math.abs(predictedY - centerY);
+          } else {
+            direction = -1; // 上へ逃げ
+            verticalDist = Math.abs(predictedY - centerY);
+          }
+          const requiredSpeed = timeToHit > 0 ? verticalDist / timeToHit : this.maxSpeed;
+          const moveSpeed = Math.max(this.baseSpeed, Math.min(requiredSpeed, this.maxSpeed));
+          let newCenterY = centerY + direction * moveSpeed;
+          if (newCenterY < 0) newCenterY = SCREEN_HEIGHT;
+          if (newCenterY > SCREEN_HEIGHT) newCenterY = 0;
+          this.y = newCenterY - this.height / 2;
+        } else {
+          // フェイント上下運動
+          if (currentTime - this.lastIdleSwitch > this.idleInterval) {
+            this.idleDirection *= -1;
+            this.lastIdleSwitch = currentTime;
+          }
+          let newCenterY = centerY + this.idleDirection * this.baseSpeed;
+          if (newCenterY < 0) newCenterY = SCREEN_HEIGHT;
+          if (newCenterY > SCREEN_HEIGHT) newCenterY = 0;
+          this.y = newCenterY - this.height / 2;
+        }
+
+        // プレイヤーY履歴追加
+        this.playerYHistory.push(player.y + player.height / 2);
+        if (this.playerYHistory.length > ENEMY_HISTORY_LEN) {
+          this.playerYHistory.shift();
+        }
+
+        // 予測射撃
+        if (
+          this.playerYHistory.length >= 2 &&
+          currentTime - this.lastFireTime > this.fireInterval
+        ) {
+          const len = this.playerYHistory.length;
+          const y1 = this.playerYHistory[len - 2];
+          const y2 = this.playerYHistory[len - 1];
+          const dy = y2 - y1;
+          const playerVy = dy;
+
+          const distXToPlayer = this.x - (player.x + player.width);
+          const timeToHit = distXToPlayer > 0
+            ? distXToPlayer / this.bulletSpeed
+            : 0;
+          const predictedPlayerY = (player.y + player.height / 2) + playerVy * timeToHit;
+
+          const ex = this.x;
+          const ey = this.y + this.height / 2 - BULLET_HEIGHT / 2;
+
+          const offsets = [];
+          const start = -Math.floor(this.directions / 2);
+          for (let i = 0; i < this.directions; i++) {
+            offsets.push((start + i) * DODGE_MARGIN);
+          }
+          for (const dyOffset of offsets) {
+            const targetY = predictedPlayerY + dyOffset;
+            const dx = (player.x + player.width) - ex;
+            const dyT = targetY - ey;
+            const distance = Math.hypot(dx, dyT);
+            let vx, vy;
+            if (distance === 0) {
+              vx = -this.bulletSpeed;
+              vy = 0;
+            } else {
+              vx = (dx / distance) * this.bulletSpeed;
+              vy = (dyT / distance) * this.bulletSpeed;
+            }
+            enemyBullets.push(new Bullet(ex, ey, vx, vy, '#FF00FF')); // マゼンタ
+          }
+          this.lastFireTime = currentTime;
+        }
+      }
+      draw(ctx) {
+        ctx.fillStyle = '#C80000'; // 赤
+        ctx.fillRect(this.x, this.y, this.width, this.height);
+      }
+    }
+
+    class InputHandler {
+      constructor() {
+        this.keys = new Set();
+        window.addEventListener('keydown', e => {
+          this.keys.add(e.key);
+        });
+        window.addEventListener('keyup', e => {
+          this.keys.delete(e.key);
+        });
+      }
+      isDown(key) {
+        return this.keys.has(key);
+      }
+      isPressed(key, lastState) {
+        // 切り替え判定に必要なら実装
+        return this.keys.has(key) && !lastState.has(key);
+      }
+    }
+
+    // ---------------------------------------------
+    // ゲーム全体の管理
+    // ---------------------------------------------
+    class Game {
+      constructor(ctx) {
+        this.ctx = ctx;
+        this.input = new InputHandler();
+        this.state = 'TITLE'; // TITLE, PLAYING, GAMEOVER
+        this.roundNumber = 1;
+
+        this.player = new Player();
+        this.enemy  = new Enemy(this.roundNumber);
+
+        this.playerBullets = [];
+        this.enemyBullets  = [];
+
+        this.lastTime = 0;
+        this.accumulator = 0;
+
+        this.gameOverTime = 0;
+        this.xLastUsedTime = 0;
+
+        this.keysLastFrame = new Set();
+
+        requestAnimationFrame(timestamp => this.loop(timestamp));
+      }
+
+      startRound() {
+        this.player = new Player();
+        this.enemy  = new Enemy(this.roundNumber);
+        this.playerBullets = [];
+        this.enemyBullets  = [];
+        this.xLastUsedTime = now() - X_COOLDOWN;
+      }
+
+      loop(timestamp) {
+        if (!this.lastTime) this.lastTime = timestamp;
+        const deltaMs = timestamp - this.lastTime;
+        this.lastTime = timestamp;
+
+        this.update(deltaMs);
+        this.draw();
+
+        // 次フレーム用にキーのSetコピー
+        this.keysLastFrame = new Set(this.input.keys);
+
+        requestAnimationFrame(ts => this.loop(ts));
+      }
+
+      update(deltaMs) {
+        const currentTime = now();
+
+        if (this.state === 'TITLE') {
+          // ENTERでゲーム開始
+          if (this.input.isDown('Enter')) {
+            this.state = 'PLAYING';
+            this.roundNumber = 1;
+            this.startRound();
+            this.lastTime = performance.now();
+          }
+        }
+        else if (this.state === 'PLAYING') {
+          // プレイヤー更新
+          this.player.update(this.input);
+
+          // ショット
+          if (this.input.isDown('z') || this.input.isDown('Z')) {
+            // Zキー：単発
+            if (!this.keysLastFrame.has('z') && !this.keysLastFrame.has('Z')) {
+              this.player.shootZ(this.playerBullets);
+            }
+          }
+          if (this.input.isDown('x') || this.input.isDown('X')) {
+            if (!this.keysLastFrame.has('x') && !this.keysLastFrame.has('X')) {
+              if (currentTime - this.xLastUsedTime >= X_COOLDOWN) {
+                this.player.shootX(this.playerBullets);
+                this.xLastUsedTime = currentTime;
+              }
+            }
+          }
+
+          // 弾更新
+          const dt = deltaMs / 16.6667; // おおまかに60FPS基準
+          for (const b of this.playerBullets) {
+            b.update(dt);
+          }
+          for (const b of this.enemyBullets) {
+            b.update(dt);
+          }
+          this.playerBullets = this.playerBullets.filter(b => b.active);
+          this.enemyBullets  = this.enemyBullets.filter(b => b.active);
+
+          // 敵AI更新
+          this.enemy.update(this.player, this.playerBullets, this.enemyBullets, currentTime);
+
+          // 当たり判定
+          // プレイヤー弾 vs 敵
+          for (const b of this.playerBullets) {
+            if (b.active) {
+              if (
+                b.x + BULLET_WIDTH > this.enemy.x &&
+                b.x < this.enemy.x + this.enemy.width &&
+                b.y + BULLET_HEIGHT > this.enemy.y &&
+                b.y < this.enemy.y + this.enemy.height
+              ) {
+                b.active = false;
+                this.winner = 'Player';
+                this.state = 'GAMEOVER';
+                this.gameOverTime = currentTime;
+                break;
+              }
+            }
+          }
+          // 敵弾 vs プレイヤー
+          for (const b of this.enemyBullets) {
+            if (b.active) {
+              if (
+                b.x < this.player.x + this.player.width &&
+                b.x + BULLET_WIDTH > this.player.x &&
+                b.y + BULLET_HEIGHT > this.player.y &&
+                b.y < this.player.y + this.player.height
+              ) {
+                b.active = false;
+                this.winner = 'Enemy';
+                this.state = 'GAMEOVER';
+                this.gameOverTime = currentTime;
+                break;
+              }
+            }
+          }
+        }
+        else if (this.state === 'GAMEOVER') {
+          if (this.winner === 'Player') {
+            // 3秒後に次ラウンド
+            if (currentTime - this.gameOverTime >= 3000) {
+              this.roundNumber++;
+              this.startRound();
+              this.state = 'PLAYING';
+              this.lastTime = performance.now();
+            }
+          } else {
+            // 敵勝利：3秒後にキー受付
+            if (currentTime - this.gameOverTime >= 3000) {
+              if (this.input.isDown(' ')) { // SPACE
+                this.roundNumber = 1;
+                this.startRound();
+                this.state = 'PLAYING';
+                this.lastTime = performance.now();
+              }
+              if (this.input.isDown('Escape')) {
+                // 終了
+                window.close();
+              }
+            }
+          }
+        }
+      }
+
+      draw() {
+        const ctx = this.ctx;
+        // 背景クリア
+        ctx.fillStyle = '#0A0A1E';
+        ctx.fillRect(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT);
+
+        if (this.state === 'TITLE') {
+          ctx.fillStyle = '#FFFFFF';
+          ctx.font = '72px sans-serif';
+          ctx.textAlign = 'center';
+          ctx.fillText('ECHO STRIKE', SCREEN_WIDTH / 2, SCREEN_HEIGHT / 2 - 50);
+          ctx.font = '24px sans-serif';
+          ctx.fillText('PRESS ENTER TO START', SCREEN_WIDTH / 2, SCREEN_HEIGHT / 2 + 20);
+        }
+        else {
+          // ラウンド数表示
+          ctx.fillStyle = '#FFFFFF';
+          ctx.font = '24px sans-serif';
+          ctx.textAlign = 'left';
+          ctx.fillText(`Round: ${this.roundNumber}`, 10, 30);
+
+          if (this.state === 'PLAYING') {
+            // プレイヤー・敵・弾描画
+            this.player.draw(ctx);
+            this.enemy.draw(ctx);
+            for (const b of this.playerBullets) b.draw(ctx);
+            for (const b of this.enemyBullets)  b.draw(ctx);
+
+            // 説明テキスト＆プログレスバー
+            const prefix = '↑↓:Move   Z:Shoot   ';
+            const xLabel = 'X:3Way';
+            const suffix = '   ESC:Quit';
+            ctx.font = '20px sans-serif';
+            ctx.textAlign = 'left';
+            ctx.fillStyle = '#FFFFFF';
+            ctx.fillText(prefix, 10, 70);
+            const prefixWidth = ctx.measureText(prefix).width;
+            const xPos = 10 + prefixWidth;
+            const yPos = 70 - 18; // baseline 調整
+
+            // プログレスバー計算
+            const currentTime = now();
+            const elapsed = currentTime - this.xLastUsedTime;
+            let barColor, progress;
+            if (elapsed < X_COOLDOWN) {
+              barColor = '#FF0000'; // 赤
+              progress = elapsed / X_COOLDOWN;
+            } else {
+              barColor = '#0000FF'; // 青
+              progress = 1;
+            }
+            const barWidth = ctx.measureText(xLabel).width;
+            const barHeight = 20;
+            // 背景バー（グレー）
+            ctx.fillStyle = '#404040';
+            ctx.fillRect(xPos, yPos, barWidth, barHeight);
+            // 進捗バー
+            ctx.fillStyle = barColor;
+            ctx.fillRect(xPos, yPos, barWidth * progress, barHeight);
+
+            // Xラベル文字をバー上に描く
+            ctx.fillStyle = '#FFFFFF';
+            ctx.fillText(xLabel, xPos, 70);
+
+            // サフィックス
+            ctx.fillText(suffix, xPos + barWidth, 70);
+          }
+          else if (this.state === 'GAMEOVER') {
+            // 勝利表示
+            ctx.fillStyle = this.winner === 'Player' ? '#FFFF00' : '#FF6464';
+            ctx.font = '48px sans-serif';
+            ctx.textAlign = 'center';
+            if (this.winner === 'Player') {
+              ctx.fillText('Player Wins!', SCREEN_WIDTH / 2, SCREEN_HEIGHT / 2 - 20);
+            } else {
+              ctx.fillText('Enemy Wins!', SCREEN_WIDTH / 2, SCREEN_HEIGHT / 2 - 20);
+              const currentTime = now();
+              if (currentTime - this.gameOverTime >= 3000) {
+                ctx.font = '24px sans-serif';
+                ctx.fillStyle = '#FFFFFF';
+                ctx.fillText('SPACE: Retry (to Round1)   ESC: Quit', SCREEN_WIDTH / 2, SCREEN_HEIGHT / 2 + 30);
+              }
+            }
+          }
+        }
+      }
+    }
+
+    // ---------------------------------------------
+    // ゲーム開始
+    // ---------------------------------------------
+    window.onload = () => {
+      const canvas = document.getElementById('gameCanvas');
+      const ctx = canvas.getContext('2d');
+      new Game(ctx);
+    };
+  </script>
+</body>
+</html>
